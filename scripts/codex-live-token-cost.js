@@ -3455,13 +3455,6 @@
       }
       stopTurnShimmer({ finishActive: true, sessionKey: taskCompleteSessionKey });
     } else if (taskCompletePayload && genericTaskCompleteWithoutSession) {
-      clearLocalTurnTimer(sessionKey);
-      const currentTurn = localCurrentTurn(sessionKey);
-      if (currentTurn) {
-        applyOfficialTurnTiming(currentTurn, payload);
-        persistLocalCurrentTurn("complete", sessionKey);
-        setLocalCurrentTurn(null, sessionKey);
-      }
       stopTurnShimmer({ finishActive: true, sessionKey });
     } else if (changed && !persistUsage && tokenCountPayload) persistLocalCurrentTurn("live", sessionKey);
     else if (changed && !persistUsage) scheduleLocalTurnCompletionCheck(0, { sessionKey });
