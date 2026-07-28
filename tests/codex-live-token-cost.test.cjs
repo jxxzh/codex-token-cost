@@ -550,6 +550,7 @@ assert.equal(code.includes("data-cltc-profile-account-label"), false);
 const listeners = new Map();
 const windowListeners = new Map();
 const storage = new Map();
+const storageWrites = new Map();
 const bridgeCalls = [];
 const helperFetchCalls = [];
 const delayedTimers = [];
@@ -706,6 +707,7 @@ const context = {
     },
     setItem(key, value) {
       storage.set(key, String(value));
+      storageWrites.set(key, (storageWrites.get(key) || 0) + 1);
     },
     key() {
       return Array.from(storage.keys())[arguments[0]] ?? null;
@@ -1066,7 +1068,7 @@ const cappedLedger = api.trimLocalLedger(
     },
   ],
 );
-assert.equal(cappedLedger.filter((turn) => turn.source === "codex-live-token-cost").length, 2000);
+assert.equal(cappedLedger.filter((turn) => turn.source === "codex-live-token-cost").length, 500);
 assert.deepEqual(
   cappedLedger.filter((turn) => turn.source === "cc-switch").map((turn) => turn.turnId),
   ["cc-history-ancient", "cc-history-may"],
@@ -1080,9 +1082,9 @@ const compactedLedger = api.compactLocalLedger([
     usage: { input: 1, output: 0, cached: 0, total: 1, exact: true },
   })),
 ]);
-assert.equal(compactedLedger.turns.length, 2000);
-assert.equal(compactedLedger.archived, 1);
-assert.equal(api.localUsageArchiveTurns(compactedLedger.archive).reduce((sum, turn) => sum + turn.usage.total, 0), 1);
+assert.equal(compactedLedger.turns.length, 500);
+assert.equal(compactedLedger.archived, 1501);
+assert.equal(api.localUsageArchiveTurns(compactedLedger.archive).reduce((sum, turn) => sum + turn.usage.total, 0), 1501);
 const recompactedLedger = api.compactLocalLedger(
   compactedLedger.turns.concat({
     turnId: "local-archive-next",
@@ -1093,8 +1095,8 @@ const recompactedLedger = api.compactLocalLedger(
   }),
   compactedLedger.archive,
 );
-assert.equal(recompactedLedger.turns.length, 2000);
-assert.equal(api.localUsageArchiveTurns(recompactedLedger.archive).reduce((sum, turn) => sum + turn.usage.total, 0), 2);
+assert.equal(recompactedLedger.turns.length, 500);
+assert.equal(api.localUsageArchiveTurns(recompactedLedger.archive).reduce((sum, turn) => sum + turn.usage.total, 0), 1502);
 const todayBuckets = api.analyticsChartBuckets(
   visibleAnalyticsTurns,
   { startMs: new Date(2026, 6, 11, 0, 0).getTime(), endMs: new Date(2026, 6, 11, 23, 59, 59, 999).getTime() },
@@ -2868,6 +2870,9 @@ domComposerState = "none";
 
 api.beginLocalTurn({ forceNewIfUsed: true });
 const beforeTokenCountTurns = api.localUsageExport().turns.length;
+const localUsageStorageKey = "__codexLiveTokenCostLocalUsageV1";
+const localUsageWritesBeforeTokenCount = storageWrites.get(localUsageStorageKey) || 0;
+const delayedTimerCountBeforeTokenCount = delayedTimers.length;
 api.inspectLocalPayload(
   {
     type: "event_msg",
@@ -2906,6 +2911,27 @@ assert.equal(mergedTokenCountTurn.turns.at(-1).usage.output, 5);
 assert.equal(mergedTokenCountTurn.turns.at(-1).usage.cached, 14);
 assert.equal(mergedTokenCountTurn.turns.at(-1).usage.total, 35);
 assert.equal(mergedTokenCountTurn.currentTurn.usage.total, 35);
+assert.equal(
+  (storageWrites.get(localUsageStorageKey) || 0) - localUsageWritesBeforeTokenCount,
+  0,
+  "连续 token_count 更新不应逐次序列化并写入完整账本",
+);
+api.persistLocalCurrentTurn("complete");
+assert.equal(
+  (storageWrites.get(localUsageStorageKey) || 0) - localUsageWritesBeforeTokenCount,
+  1,
+  "终态持久化应取消待执行的防抖任务并立即写入一次",
+);
+const supersededLedgerSaveTimers = delayedTimers
+  .slice(delayedTimerCountBeforeTokenCount)
+  .filter((timer) => timer.delay === 1500);
+assert.equal(supersededLedgerSaveTimers.length, 2);
+for (const timer of supersededLedgerSaveTimers) timer.handler();
+assert.equal(
+  (storageWrites.get(localUsageStorageKey) || 0) - localUsageWritesBeforeTokenCount,
+  1,
+  "已被终态写入取代的防抖回调不得重复写入",
+);
 
 const boundary = "----codex-test-boundary";
 const multipart = [

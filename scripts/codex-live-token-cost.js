@@ -69,7 +69,8 @@ const VERSION = "0.7.8";
   const PROFILE_IMAGE_UPLOAD_MAX_DIMENSION = 512;
   const PROFILE_HEATMAP_BASE_START = "2025-07-13";
   const PROFILE_HEATMAP_MAX_COLUMNS = 52;
-  const LOCAL_LEDGER_LIMIT = 2000;
+  const LOCAL_LEDGER_LIMIT = 500;
+  const LOCAL_LEDGER_SAVE_DEBOUNCE_MS = 1500;
   const LOCAL_LIVE_TURN_RESTORE_MAX_AGE_MS = 15 * 60 * 1000;
   const UNKNOWN_MODEL = "未知";
   const FAST_MODE_ICON_PATH =
@@ -255,6 +256,7 @@ const VERSION = "0.7.8";
     localCurrentTurns: new Map(),
     localTurnTimer: 0,
     localTurnTimers: new Map(),
+    localLedgerSaveTimer: 0,
     localTurnSeq: 0,
     localSeenUsage: new Map(),
     localPersistedUsage: new Map(),
@@ -2497,6 +2499,7 @@ const VERSION = "0.7.8";
   }
 
   function saveLocalLedger() {
+    cancelScheduledLocalLedgerSave();
     try {
       const compacted = compactLocalLedger(state.localLedger, state.localUsageArchive);
       state.localLedger = compacted.turns;
@@ -2516,6 +2519,32 @@ const VERSION = "0.7.8";
     } catch {
       // Ignore quota or privacy-mode failures.
     }
+  }
+
+  function cancelScheduledLocalLedgerSave() {
+    const timer = state.localLedgerSaveTimer;
+    if (!timer) return false;
+    window.clearTimeout(timer);
+    state.localLedgerSaveTimer = 0;
+    return true;
+  }
+
+  function scheduleLocalLedgerSave(delay = LOCAL_LEDGER_SAVE_DEBOUNCE_MS) {
+    cancelScheduledLocalLedgerSave();
+    const timer = window.setTimeout(() => {
+      if (state.localLedgerSaveTimer !== timer) return;
+      state.localLedgerSaveTimer = 0;
+      saveLocalLedger();
+    }, Math.max(0, toCount(delay)));
+    state.localLedgerSaveTimer = timer;
+    return timer;
+  }
+
+  function flushLocalLedgerSave(force = false) {
+    const pending = cancelScheduledLocalLedgerSave();
+    if (!pending && !force) return false;
+    saveLocalLedger();
+    return true;
   }
 
   function normalizedDurationMs(raw, startedAt = 0, finishedAt = 0) {
@@ -4237,7 +4266,8 @@ const VERSION = "0.7.8";
     state.localLast = { ...metric, persistReason: reason };
     state.localLedger = state.localLedger.filter((item) => item.turnId !== metric.turnId).concat(state.localLast);
     state.localPersistedUsage.set(usageKey(metric.usage), Date.now());
-    saveLocalLedger();
+    if (reason === "live") scheduleLocalLedgerSave();
+    else flushLocalLedgerSave(true);
     rememberDailyUsage(metric);
     scheduleProfileUsageRefresh();
     return true;
@@ -9564,6 +9594,7 @@ const VERSION = "0.7.8";
   }
 
   function destroy() {
+    flushLocalLedgerSave();
     state.started = false;
     stopProfileUiReadinessCoordinator();
     stopSidebarProfileIdentitySync();
