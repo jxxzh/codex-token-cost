@@ -10,6 +10,7 @@ const priceSourceCode = fs.readFileSync(priceSourcePath, "utf8").replace(/\r\n/g
 
 function createIndexedDbTestDouble() {
   const databases = new Map();
+  const stats = { transactions: 0, puts: 0 };
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const databaseApi = (record) => ({
     objectStoreNames: { contains: (name) => record.stores.has(name) },
@@ -19,6 +20,7 @@ function createIndexedDbTestDouble() {
       return store;
     },
     transaction(names) {
+      stats.transactions += 1;
       const tx = { error: null, oncomplete: null, onerror: null, onabort: null };
       const allowed = Array.isArray(names) ? names : [names];
       let operations = 0;
@@ -37,6 +39,7 @@ function createIndexedDbTestDouble() {
         assert.ok(store);
         return {
           put(value) {
+            stats.puts += 1;
             const request = { result: undefined, onsuccess: null, onerror: null };
             schedule(() => {
               store.rows.set(String(value[store.keyPath]), clone(value));
@@ -60,6 +63,7 @@ function createIndexedDbTestDouble() {
     close() {},
   });
   return {
+    stats,
     open(name, version) {
       const request = { result: null, error: null, onupgradeneeded: null, onsuccess: null, onerror: null };
       queueMicrotask(() => {
@@ -85,7 +89,7 @@ assert.equal(code.includes('pushState(history.state, "", "/settings/profile")'),
 assert.equal(code.includes("@run-at       document-start"), true);
 assert.equal(code.includes("window.postMessage(message"), true);
 assert.equal(code.includes('"codex-message-from-view"'), true);
-assert.equal(code.includes('const VERSION = "0.7.8"'), true);
+assert.equal(code.includes('const VERSION = "0.7.8.1"'), true);
 assert.equal(code.includes("function syncSidebarProfileIdentity"), true);
 assert.equal(code.includes("void installProfileAuthContextPatch();"), false);
 assert.equal(code.includes("profileAuthValuePatches"), false);
@@ -660,6 +664,7 @@ storage.set(
     ],
   }),
 );
+storage.set("__codexLiveTokenCostProfileUnlockEnabledV1", "true");
 const context = {
   console,
   setTimeout(handler, delay = 0) {
@@ -756,6 +761,12 @@ vm.runInNewContext(code, context, { filename: scriptPath });
 
 const api = context.__codexLiveTokenCostTest;
 assert.equal(context.Promise.prototype.then.__codexLiveTokenCostProfileUnlock, undefined);
+assert.equal(context.Array.prototype.filter.__codexLiveTokenCostProfileUnlock, undefined);
+assert.equal(context.RegExp.prototype.test.__codexLiveTokenCostProfileUnlock, undefined);
+storage.delete("__codexLiveTokenCostProfileUnlockEnabledV1");
+assert.equal(api.profileUnlockEnabled(), false);
+storage.set("__codexLiveTokenCostProfileUnlockEnabledV1", "true");
+assert.equal(api.profileUnlockEnabled(), true);
 assert.equal(typeof api.spoofProfileAccountPayload, "function");
 assert.equal(typeof api.beginLocalTurn, "function");
 assert.equal(typeof api.persistLocalCurrentTurn, "function");
@@ -1162,7 +1173,7 @@ const unavailableCacheWriteHtml = api.usageAnalyticsHtml({
   ],
 });
 assert.equal(unavailableCacheWriteHtml.includes("写缓存<strong>未提供</strong>"), true);
-assert.equal(context.__codexLiveTokenCost.version, "0.7.8");
+assert.equal(context.__codexLiveTokenCost.version, "0.7.8.1");
 assert.equal(api.currentSessionKey().startsWith("new:startup:"), true);
 assert.equal(api.extractSessionKeyFromUrl("/thread/thread-1"), "thread-1");
 assert.equal(api.extractSessionKeyFromUrl("/api/conversation?conversationId=thread-1"), "thread-1");
@@ -2110,7 +2121,7 @@ delayedProfileButton = {
   },
 };
 profileReadinessObserver.callback([{ addedNodes: [delayedProfileButton] }]);
-assert.equal(context.__codexLiveTokenCostProfileAuthPatch, "0.7.8");
+assert.equal(context.__codexLiveTokenCostProfileAuthPatch, "0.7.8.1");
 assert.equal(api.profileSyntheticAuth(), true);
 assert.equal(profileReadinessObserver.disconnected, true);
 assert.equal(delayedProfileCacheWrites.length > 0, true);
@@ -2871,7 +2882,10 @@ domComposerState = "none";
 api.beginLocalTurn({ forceNewIfUsed: true });
 const beforeTokenCountTurns = api.localUsageExport().turns.length;
 const localUsageStorageKey = "__codexLiveTokenCostLocalUsageV1";
+const profileLedgerStorageKey = "__codexLiveTokenCostProfileLedgerV2";
+const dailyUsageStorageKey = "__codexLiveTokenCostDailyUsageV1";
 const localUsageWritesBeforeTokenCount = storageWrites.get(localUsageStorageKey) || 0;
+const storageWritesBeforeTokenCount = new Map(storageWrites);
 const delayedTimerCountBeforeTokenCount = delayedTimers.length;
 api.inspectLocalPayload(
   {
@@ -2911,6 +2925,14 @@ assert.equal(mergedTokenCountTurn.turns.at(-1).usage.output, 5);
 assert.equal(mergedTokenCountTurn.turns.at(-1).usage.cached, 14);
 assert.equal(mergedTokenCountTurn.turns.at(-1).usage.total, 35);
 assert.equal(mergedTokenCountTurn.currentTurn.usage.total, 35);
+assert.deepEqual(
+  {
+    profileLedger: (storageWrites.get(profileLedgerStorageKey) || 0) - (storageWritesBeforeTokenCount.get(profileLedgerStorageKey) || 0),
+    dailyUsage: (storageWrites.get(dailyUsageStorageKey) || 0) - (storageWritesBeforeTokenCount.get(dailyUsageStorageKey) || 0),
+  },
+  { profileLedger: 0, dailyUsage: 0 },
+  "连续 token_count 更新不应逐次写入 Profile 与每日账本",
+);
 assert.equal(
   (storageWrites.get(localUsageStorageKey) || 0) - localUsageWritesBeforeTokenCount,
   0,
@@ -2922,6 +2944,14 @@ assert.equal(
   1,
   "终态持久化应取消待执行的防抖任务并立即写入一次",
 );
+assert.deepEqual(
+  {
+    profileLedger: (storageWrites.get(profileLedgerStorageKey) || 0) - (storageWritesBeforeTokenCount.get(profileLedgerStorageKey) || 0),
+    dailyUsage: (storageWrites.get(dailyUsageStorageKey) || 0) - (storageWritesBeforeTokenCount.get(dailyUsageStorageKey) || 0),
+  },
+  { profileLedger: 1, dailyUsage: 1 },
+  "终态持久化应各写入一次 Profile 与每日账本",
+);
 const supersededLedgerSaveTimers = delayedTimers
   .slice(delayedTimerCountBeforeTokenCount)
   .filter((timer) => timer.delay === 1500);
@@ -2931,6 +2961,19 @@ assert.equal(
   (storageWrites.get(localUsageStorageKey) || 0) - localUsageWritesBeforeTokenCount,
   1,
   "已被终态写入取代的防抖回调不得重复写入",
+);
+const supersededProfileSaveTimers = delayedTimers
+  .slice(delayedTimerCountBeforeTokenCount)
+  .filter((timer) => timer.delay === 2000);
+assert.equal(supersededProfileSaveTimers.length, 2);
+for (const timer of supersededProfileSaveTimers) timer.handler();
+assert.deepEqual(
+  {
+    profileLedger: (storageWrites.get(profileLedgerStorageKey) || 0) - (storageWritesBeforeTokenCount.get(profileLedgerStorageKey) || 0),
+    dailyUsage: (storageWrites.get(dailyUsageStorageKey) || 0) - (storageWritesBeforeTokenCount.get(dailyUsageStorageKey) || 0),
+  },
+  { profileLedger: 1, dailyUsage: 1 },
+  "已被终态写入取代的 Profile 防抖回调不得重复写入",
 );
 
 const boundary = "----codex-test-boundary";
@@ -4069,7 +4112,7 @@ assert.equal(api.restoreRunningCurrentTurnFromLast(realThreadKey, Date.now() + 1
 assert.equal(api.restoreRunningCurrentTurnFromLast(realThreadKey), true);
 api.finishLocalTurn(0, { reason: "recent-live-reload-reset", force: true, sessionKey: realThreadKey });
 assert.deepEqual([1, 2, 3].filter((value) => value > 1), [2, 3]);
-assert.equal(/^[a-z0-9._-]+$/.test("UPPER"), true);
+assert.equal(/^[a-z0-9._-]+$/.test("UPPER"), false);
 Promise.resolve({ account: { type: "apiKey", planType: "api" }, requiresOpenaiAuth: true }).then((value) => {
   assert.equal(value.account.type, "apiKey");
   assert.equal(value.requiresOpenaiAuth, true);
@@ -4267,7 +4310,7 @@ const profileLifecycleTest = Promise.resolve()
     const localMessageHandler = api.localMessageHandler();
     assert.equal(typeof localMessageHandler, "function");
     assert.equal((windowListeners.get("message") || []).length, messageListenersBeforeLocalCapture + 1);
-assert.equal(context.__codexLiveTokenCostMessageCapture, "0.7.8");
+assert.equal(context.__codexLiveTokenCostMessageCapture, "0.7.8.1");
     context.document.getElementById = () => null;
     context.__codexLiveTokenCost.destroy();
     assert.equal((windowListeners.get("message") || []).includes(localMessageHandler), false);
@@ -4660,7 +4703,7 @@ profileLifecycleTest.then(async () => {
   const bulkAfter = api.localProfileResponse();
   assert.equal(bulkAfter.stats.lifetime_tokens, bulkBefore.stats.lifetime_tokens + 2001);
   assert.ok(
-    api.localUsageExport().turns.filter((turn) => turn.source !== "cc-switch" && turn.importSource !== "cc-switch").length <= 2000,
+    api.localUsageExport().turns.filter((turn) => turn.source !== "cc-switch" && turn.importSource !== "cc-switch").length <= 500,
   );
 
   const profileBeforeSessionDelete = api.localProfileResponse();
@@ -4727,7 +4770,8 @@ profileLifecycleTest.then(async () => {
       },
     }),
   );
-  context.indexedDB = createIndexedDbTestDouble();
+  const indexedDbDouble = createIndexedDbTestDouble();
+  context.indexedDB = indexedDbDouble;
   vm.runInNewContext(code, context, { filename: scriptPath });
   const hydratedSnapshotProfile = context.__codexLiveTokenCostTest.localProfileResponse();
   assert.equal(hydratedSnapshotProfile.stats.lifetime_tokens, 12);
@@ -4742,6 +4786,37 @@ profileLifecycleTest.then(async () => {
   const idbApi = context.__codexLiveTokenCostTest;
   idbApi.localProfileResponse();
   for (let index = 0; index < 3; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  const idbLiveSession = "idb-live-token-thread";
+  idbApi.beginLocalTurn({
+    sessionKey: idbLiveSession,
+    turnId: "idb-live-token-turn",
+    profileThreadKey: idbLiveSession,
+    threadAttributionStatus: "reliable",
+  });
+  for (let index = 0; index < 3; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  const idbTransactionsBeforeLiveTokens = indexedDbDouble.stats.transactions;
+  for (let index = 1; index <= 2; index += 1) {
+    idbApi.inspectLocalPayload(
+      {
+        threadId: idbLiveSession,
+        type: "token_count",
+        info: {
+          last_token_usage: {
+            input_tokens: 20 * index,
+            output_tokens: 2 * index,
+            total_tokens: 22 * index,
+          },
+        },
+      },
+      "message",
+    );
+  }
+  for (let index = 0; index < 3; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(indexedDbDouble.stats.transactions, idbTransactionsBeforeLiveTokens);
+  idbApi.persistLocalCurrentTurn("complete", idbLiveSession, { durationStatus: "completed" });
+  idbApi.setLocalCurrentTurn(null, idbLiveSession);
+  for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(indexedDbDouble.stats.transactions, idbTransactionsBeforeLiveTokens + 1);
   idbApi.beginLocalTurn({
     sessionKey: "idb-roundtrip-thread",
     turnId: "idb-roundtrip-turn",

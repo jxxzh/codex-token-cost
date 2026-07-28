@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Live Token Cost
 // @namespace    codex-plus-plus
-// @version      0.7.8
+// @version      0.7.8.1
 // @description  在 Codex 输入框上方显示 Token 与金额，解锁官方个人资料页并替换为本地统计；通过设置按钮管理价格和伪装资料。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-const VERSION = "0.7.8";
+const VERSION = "0.7.8.1";
   const ROOT_ID = "codex-live-token-cost";
   const SETTINGS_BUTTON_ID = "codex-live-token-cost-settings";
   const STYLE_ID = "codex-live-token-cost-style";
@@ -40,6 +40,7 @@ const VERSION = "0.7.8";
   const PROFILE_LEDGER_STORE_USAGE_CALLS = "profileUsageCalls";
   const PROFILE_LEDGER_STORE_INVOCATIONS = "profileInvocations";
   const PROFILE_LEDGER_STORE_DAILY_ROLLUPS = "profileDailyRollups";
+  const PROFILE_LEDGER_SAVE_DEBOUNCE_MS = 2000;
   let profileUnlockEnabledRuntime;
   const PROJECT_CONTEXT_ROW_SELECTOR =
     "[data-codex-composer-root] [data-composer-utility-bar-scroll-area] [data-composer-navigation-target='workspace-project']";
@@ -266,6 +267,10 @@ const VERSION = "0.7.8";
     profileLedgerDb: null,
     profileLedgerDbPromise: null,
     profileLedgerWriteQueue: Promise.resolve(),
+    profileLedgerSaveTimer: 0,
+    profileLedgerPendingTurns: new Map(),
+    profileLedgerPendingCalls: new Map(),
+    profileLedgerPendingInvocations: new Map(),
     profileLedgerMigrationChecked: false,
     profileInvocationSeq: 0,
     legacySessionMigrations: new Set(),
@@ -679,7 +684,7 @@ const VERSION = "0.7.8";
       });
   }
 
-  function profileLedgerQueueWrite(turn, calls = [], invocations = []) {
+  function profileLedgerQueueBatchWrite(turns = [], calls = [], invocations = []) {
     if (state.profileLedgerStorage !== "indexeddb") return;
     state.profileLedgerWriteQueue = state.profileLedgerWriteQueue
       .then(
@@ -693,7 +698,7 @@ const VERSION = "0.7.8";
             [PROFILE_LEDGER_STORE_TURNS, PROFILE_LEDGER_STORE_USAGE_CALLS, PROFILE_LEDGER_STORE_INVOCATIONS, PROFILE_LEDGER_STORE_DAILY_ROLLUPS],
             "readwrite",
           );
-          if (turn) tx.objectStore(PROFILE_LEDGER_STORE_TURNS).put(turn);
+          turns.forEach((turn) => tx.objectStore(PROFILE_LEDGER_STORE_TURNS).put(turn));
           calls.forEach((call) => tx.objectStore(PROFILE_LEDGER_STORE_USAGE_CALLS).put(call));
           invocations.forEach((invocation) => tx.objectStore(PROFILE_LEDGER_STORE_INVOCATIONS).put(invocation));
           rollupDays.forEach((day) => tx.objectStore(PROFILE_LEDGER_STORE_DAILY_ROLLUPS).put(day));
@@ -707,6 +712,59 @@ const VERSION = "0.7.8";
         state.profileLedgerDb = null;
         saveProfileLedgerSnapshot();
       });
+  }
+
+  function profileLedgerQueueWrite(turn, calls = [], invocations = []) {
+    return profileLedgerQueueBatchWrite(turn ? [turn] : [], calls, invocations);
+  }
+
+  function stageProfileLedgerCommit(turn, calls = [], invocations = []) {
+    if (turn?.turnId) state.profileLedgerPendingTurns.set(turn.turnId, turn);
+    for (const call of calls) {
+      if (call?.id) state.profileLedgerPendingCalls.set(call.id, call);
+    }
+    for (const invocation of invocations) {
+      if (invocation?.invocationId) state.profileLedgerPendingInvocations.set(invocation.invocationId, invocation);
+    }
+  }
+
+  function cancelScheduledProfileLedgerCommit() {
+    const timer = state.profileLedgerSaveTimer;
+    if (!timer) return false;
+    window.clearTimeout(timer);
+    state.profileLedgerSaveTimer = 0;
+    return true;
+  }
+
+  function scheduleProfileLedgerCommit(delay = PROFILE_LEDGER_SAVE_DEBOUNCE_MS) {
+    cancelScheduledProfileLedgerCommit();
+    const timer = window.setTimeout(() => {
+      if (state.profileLedgerSaveTimer !== timer) return;
+      state.profileLedgerSaveTimer = 0;
+      flushProfileLedgerCommit();
+    }, Math.max(0, toCount(delay)));
+    state.profileLedgerSaveTimer = timer;
+    return timer;
+  }
+
+  function flushProfileLedgerCommit(force = false) {
+    const pendingTimer = cancelScheduledProfileLedgerCommit();
+    const hasPending =
+      state.profileLedgerPendingTurns.size > 0 ||
+      state.profileLedgerPendingCalls.size > 0 ||
+      state.profileLedgerPendingInvocations.size > 0;
+    if (!hasPending && !pendingTimer && !force) return false;
+    const turns = Array.from(state.profileLedgerPendingTurns.values());
+    const calls = Array.from(state.profileLedgerPendingCalls.values());
+    const invocations = Array.from(state.profileLedgerPendingInvocations.values());
+    state.profileLedgerPendingTurns.clear();
+    state.profileLedgerPendingCalls.clear();
+    state.profileLedgerPendingInvocations.clear();
+    profileLedgerRebuildRollup();
+    saveProfileLedgerSnapshot();
+    profileLedgerQueueBatchWrite(turns, calls, invocations);
+    scheduleProfileUsageRefresh();
+    return true;
   }
 
   function profileLedgerQueueSnapshotWrite() {
@@ -929,7 +987,8 @@ const VERSION = "0.7.8";
       observedAt: now,
       usage: null,
     };
-    const previous = ledger.turns.find((item) => item.turnId === metricBase.turnId);
+    const existingIndex = ledger.turns.findIndex((item) => item.turnId === metricBase.turnId);
+    const previous = existingIndex >= 0 ? ledger.turns[existingIndex] : null;
     const durationStatus = options.durationStatus === "completed" ? "completed" : options.durationStatus === "recovered" ? "recovered" : "incomplete";
     const startedAt = toTimestampMs(metricBase.startedAt) || now;
     const completedAtMs = durationStatus === "completed" ? toTimestampMs(turn.officialTiming?.completedAtMs || options.completedAt) || now : 0;
@@ -963,11 +1022,17 @@ const VERSION = "0.7.8";
       ledger.usageCalls[id] = record;
       calls.push(record);
     }
-    const turnCalls = Object.values(ledger.usageCalls).filter((call) => call.turnId === metricBase.turnId);
-    profileTurn.usage = turnCalls.length
-      ? turnCalls.reduce((sum, call) => addUsage(sum, call.usage), { input: 0, output: 0, cached: 0, total: 0, exact: true })
-      : metricBase.usage;
-    profileTurn.callCount = turnCalls.length || toCount(metricBase.callCount) || (profileTurn.usage ? 1 : 0);
+    const metricUsage = normalizeUsage(metricBase.usage);
+    if (metricUsage.exact) {
+      profileTurn.usage = metricUsage;
+      profileTurn.callCount = toCount(metricBase.callCount) || (profileTurn.usage ? 1 : 0);
+    } else {
+      const turnCalls = Object.values(ledger.usageCalls).filter((call) => call.turnId === metricBase.turnId);
+      profileTurn.usage = turnCalls.length
+        ? turnCalls.reduce((sum, call) => addUsage(sum, call.usage), { input: 0, output: 0, cached: 0, total: 0, exact: true })
+        : metricBase.usage;
+      profileTurn.callCount = turnCalls.length || toCount(metricBase.callCount) || (profileTurn.usage ? 1 : 0);
+    }
     const invocations = [];
     const seenInvocationIds = new Set(profileTurn.invocationIds || []);
     const invocationInputs = Array.isArray(options.invocations) ? options.invocations : Array.isArray(metricBase.invocations) ? metricBase.invocations : [];
@@ -990,14 +1055,13 @@ const VERSION = "0.7.8";
     });
     profileTurn.invocationIds = Array.from(seenInvocationIds);
     profileTurn.invocations = [];
-    const existingIndex = ledger.turns.findIndex((item) => item.turnId === profileTurn.turnId);
     const merged = mergeProfileTurn(existingIndex >= 0 ? ledger.turns[existingIndex] : null, profileTurn);
     merged.invocationIds = Array.from(new Set([...(existingIndex >= 0 ? ledger.turns[existingIndex].invocationIds || [] : []), ...profileTurn.invocationIds]));
     if (existingIndex >= 0) ledger.turns[existingIndex] = merged;
     else ledger.turns.push(merged);
-    profileLedgerRebuildRollup();
-    saveProfileLedgerSnapshot();
-    profileLedgerQueueWrite(merged, calls, invocations);
+    stageProfileLedgerCommit(merged, calls, invocations);
+    if (options.deferCommit) scheduleProfileLedgerCommit();
+    else flushProfileLedgerCommit(true);
     return true;
   }
 
@@ -1053,9 +1117,9 @@ const VERSION = "0.7.8";
   function profileUnlockEnabled() {
     if (typeof profileUnlockEnabledRuntime === "boolean") return profileUnlockEnabledRuntime;
     try {
-      return localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) !== "false";
+      return localStorage.getItem(PROFILE_UNLOCK_ENABLED_KEY) === "true";
     } catch {
-      return true;
+      return false;
     }
   }
 
@@ -4251,16 +4315,18 @@ const VERSION = "0.7.8";
     const metric = localTurnMetric(current);
     const profileThreadKey = normalizeText(current.profileThreadKey, 240);
     const profileThreadAttributionStatus = current.profileThreadAttributionStatus === "reliable" && profileThreadKey ? "reliable" : "unknown";
-    profileLedgerObserveLocalTurn(current, current.context, {
-      reason,
-      durationStatus: options.durationStatus === "completed" ? "completed" : options.durationStatus === "recovered" ? "recovered" : "incomplete",
-      completedAt: options.completedAt,
-      observedAt: Date.now(),
-      threadKey: profileThreadKey,
-      threadAttributionStatus: profileThreadAttributionStatus,
-      calls: [],
-      invocations: [],
-    });
+    if (reason !== "live") {
+      profileLedgerObserveLocalTurn(current, current.context, {
+        reason,
+        durationStatus: options.durationStatus === "completed" ? "completed" : options.durationStatus === "recovered" ? "recovered" : "incomplete",
+        completedAt: options.completedAt,
+        observedAt: Date.now(),
+        threadKey: profileThreadKey,
+        threadAttributionStatus: profileThreadAttributionStatus,
+        calls: [],
+        invocations: [],
+      });
+    }
     if (!metric) return false;
     if (isTransientSessionKey(key)) return false;
     state.localLast = { ...metric, persistReason: reason };
@@ -4268,8 +4334,7 @@ const VERSION = "0.7.8";
     state.localPersistedUsage.set(usageKey(metric.usage), Date.now());
     if (reason === "live") scheduleLocalLedgerSave();
     else flushLocalLedgerSave(true);
-    rememberDailyUsage(metric);
-    scheduleProfileUsageRefresh();
+    if (reason !== "live") rememberDailyUsage(metric);
     return true;
   }
 
@@ -4322,8 +4387,8 @@ const VERSION = "0.7.8";
       invocationEventId: options.invocationEventId,
       threadKey: options.profileThreadKey,
       threadAttributionStatus: options.threadAttributionStatus,
+      deferCommit: true,
     });
-    scheduleProfileUsageRefresh();
     if (!persist) return true;
     persistLocalCurrentTurn("final", sessionKey);
     scheduleRender();
@@ -6287,18 +6352,6 @@ const VERSION = "0.7.8";
 
   function installOfficialProfileUnlock() {
     if (!profileUnlockEnabled()) return;
-    const originalFilter = Array.prototype.__codexLiveTokenCostOriginalFilter || Array.prototype.filter;
-    if (Array.prototype.filter.__codexLiveTokenCostProfileUnlock !== VERSION) {
-      const patchedFilter = function codexLiveTokenCostProfileFilter(callback, thisArg) {
-        const visible = originalFilter.call(this, callback, thisArg);
-        return isSettingsSectionsArray(this) ? profileUnlockedSettingsSections(this, visible) : visible;
-      };
-      patchedFilter.__codexLiveTokenCostProfileUnlock = VERSION;
-      Array.prototype.__codexLiveTokenCostOriginalFilter = originalFilter;
-      Array.prototype.filter = patchedFilter;
-    }
-
-    installProfileUsernameUppercaseUnlock();
     installProfileMessageIntercept();
     installElectronBridgeHook();
     void installProfileRequestClientPatch();
@@ -9594,6 +9647,7 @@ const VERSION = "0.7.8";
   }
 
   function destroy() {
+    flushProfileLedgerCommit();
     flushLocalLedgerSave();
     state.started = false;
     stopProfileUiReadinessCoordinator();
