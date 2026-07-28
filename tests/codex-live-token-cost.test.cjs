@@ -48,6 +48,14 @@ function createIndexedDbTestDouble() {
             });
             return request;
           },
+          clear() {
+            const request = { result: undefined, onsuccess: null, onerror: null };
+            schedule(() => {
+              store.rows.clear();
+              request.onsuccess?.({ target: request });
+            });
+            return request;
+          },
           getAll() {
             const request = { result: [], onsuccess: null, onerror: null };
             schedule(() => {
@@ -89,7 +97,7 @@ assert.equal(code.includes('pushState(history.state, "", "/settings/profile")'),
 assert.equal(code.includes("@run-at       document-start"), true);
 assert.equal(code.includes("window.postMessage(message"), true);
 assert.equal(code.includes('"codex-message-from-view"'), true);
-assert.equal(code.includes('const VERSION = "0.7.8.1"'), true);
+assert.equal(code.includes('const VERSION = "0.7.8.2"'), true);
 assert.equal(code.includes("function syncSidebarProfileIdentity"), true);
 assert.equal(code.includes("void installProfileAuthContextPatch();"), false);
 assert.equal(code.includes("profileAuthValuePatches"), false);
@@ -1173,7 +1181,7 @@ const unavailableCacheWriteHtml = api.usageAnalyticsHtml({
   ],
 });
 assert.equal(unavailableCacheWriteHtml.includes("写缓存<strong>未提供</strong>"), true);
-assert.equal(context.__codexLiveTokenCost.version, "0.7.8.1");
+assert.equal(context.__codexLiveTokenCost.version, "0.7.8.2");
 assert.equal(api.currentSessionKey().startsWith("new:startup:"), true);
 assert.equal(api.extractSessionKeyFromUrl("/thread/thread-1"), "thread-1");
 assert.equal(api.extractSessionKeyFromUrl("/api/conversation?conversationId=thread-1"), "thread-1");
@@ -1936,6 +1944,30 @@ assert.equal(tokenCountEventUsages[0].output, 1051);
 assert.equal(tokenCountEventUsages[0].cached, 106880);
 assert.equal(tokenCountEventUsages[0].total, 121496);
 assert.equal(tokenCountEventUsages[0].exact, true);
+const tokenCountTotal = api.tokenCountTotalUsage({
+  type: "event_msg",
+  payload: {
+    type: "token_count",
+    info: {
+      total_token_usage: {
+        input_tokens: 912684,
+        cached_input_tokens: 800384,
+        output_tokens: 6217,
+        total_tokens: 918901,
+      },
+      last_token_usage: {
+        input_tokens: 120445,
+        cached_input_tokens: 106880,
+        output_tokens: 1051,
+        total_tokens: 121496,
+      },
+    },
+  },
+});
+assert.equal(tokenCountTotal.input, 912684);
+assert.equal(tokenCountTotal.output, 6217);
+assert.equal(tokenCountTotal.cached, 800384);
+assert.equal(tokenCountTotal.total, 918901);
 assert.equal(api.isTokenCountPayload({ type: "token_count", info: { last_token_usage: { total_tokens: 1 } } }), true);
 assert.equal(api.isTokenCountPayload({ type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { total_tokens: 1 } } } }), true);
 const cacheReadCost = api.costForModelUsage(cacheReadUsage, "gpt-5.5");
@@ -2121,7 +2153,7 @@ delayedProfileButton = {
   },
 };
 profileReadinessObserver.callback([{ addedNodes: [delayedProfileButton] }]);
-assert.equal(context.__codexLiveTokenCostProfileAuthPatch, "0.7.8.1");
+assert.equal(context.__codexLiveTokenCostProfileAuthPatch, "0.7.8.2");
 assert.equal(api.profileSyntheticAuth(), true);
 assert.equal(profileReadinessObserver.disconnected, true);
 assert.equal(delayedProfileCacheWrites.length > 0, true);
@@ -2975,6 +3007,66 @@ assert.deepEqual(
   { profileLedger: 1, dailyUsage: 1 },
   "已被终态写入取代的 Profile 防抖回调不得重复写入",
 );
+const longTokenSession = "long-token-count-thread";
+api.beginLocalTurn({
+  sessionKey: longTokenSession,
+  turnId: "long-token-count-turn",
+  profileThreadKey: longTokenSession,
+  threadAttributionStatus: "reliable",
+});
+const longTokenStateBefore = api.performanceState(longTokenSession);
+let longTokenInput = 0;
+let longTokenOutput = 0;
+for (let index = 1; index <= 300; index += 1) {
+  const lastInput = 10 + index;
+  const lastOutput = 1;
+  longTokenInput += lastInput;
+  longTokenOutput += lastOutput;
+  assert.equal(
+    api.inspectLocalPayload(
+      {
+        threadId: longTokenSession,
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: longTokenInput,
+            output_tokens: longTokenOutput,
+            total_tokens: longTokenInput + longTokenOutput,
+          },
+          last_token_usage: {
+            input_tokens: lastInput,
+            output_tokens: lastOutput,
+            total_tokens: lastInput + lastOutput,
+          },
+        },
+      },
+      "message",
+    ),
+    true,
+  );
+}
+const longTokenState = api.performanceState(longTokenSession);
+assert.deepEqual(
+  {
+    currentCalls: longTokenState.currentCalls,
+    currentCallCount: longTokenState.currentCallCount,
+    currentUsageTotal: longTokenState.currentUsageTotal,
+    localPersistedUsageGrowth: longTokenState.localPersistedUsage - longTokenStateBefore.localPersistedUsage,
+    profileUsageCallsGrowth: longTokenState.profileUsageCalls - longTokenStateBefore.profileUsageCalls,
+    profilePendingCallsGrowth: longTokenState.profilePendingCalls - longTokenStateBefore.profilePendingCalls,
+  },
+  {
+    currentCalls: 1,
+    currentCallCount: 300,
+    currentUsageTotal: longTokenInput + longTokenOutput,
+    localPersistedUsageGrowth: 0,
+    profileUsageCallsGrowth: 0,
+    profilePendingCallsGrowth: 0,
+  },
+  "长任务中的累计 token_count 应保持常数级状态，而不是为每个快照追加记录",
+);
+api.persistLocalCurrentTurn("complete", longTokenSession, { durationStatus: "completed" });
+api.setLocalCurrentTurn(null, longTokenSession);
 
 const boundary = "----codex-test-boundary";
 const multipart = [
@@ -4310,7 +4402,7 @@ const profileLifecycleTest = Promise.resolve()
     const localMessageHandler = api.localMessageHandler();
     assert.equal(typeof localMessageHandler, "function");
     assert.equal((windowListeners.get("message") || []).length, messageListenersBeforeLocalCapture + 1);
-assert.equal(context.__codexLiveTokenCostMessageCapture, "0.7.8.1");
+assert.equal(context.__codexLiveTokenCostMessageCapture, "0.7.8.2");
     context.document.getElementById = () => null;
     context.__codexLiveTokenCost.destroy();
     assert.equal((windowListeners.get("message") || []).includes(localMessageHandler), false);

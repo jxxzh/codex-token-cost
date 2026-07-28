@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Live Token Cost
 // @namespace    codex-plus-plus
-// @version      0.7.8.1
+// @version      0.7.8.2
 // @description  在 Codex 输入框上方显示 Token 与金额，解锁官方个人资料页并替换为本地统计；通过设置按钮管理价格和伪装资料。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-const VERSION = "0.7.8.1";
+const VERSION = "0.7.8.2";
   const ROOT_ID = "codex-live-token-cost";
   const SETTINGS_BUTTON_ID = "codex-live-token-cost-settings";
   const STYLE_ID = "codex-live-token-cost-style";
@@ -502,12 +502,6 @@ const VERSION = "0.7.8.1";
     if (!raw || typeof raw !== "object" || raw.version !== PROFILE_LEDGER_VERSION) return ledger;
     ledger.migrationComplete = raw.migrationComplete === true;
     ledger.turns = (Array.isArray(raw.turns) ? raw.turns : []).map(profileNormalizeTurn).filter(Boolean);
-    for (const call of Array.isArray(raw.usageCalls) ? raw.usageCalls : []) {
-      const id = normalizeText(call?.id || call?.usageCallId, 300);
-      const turnId = normalizeText(call?.turnId, 240);
-      const usage = normalizeUsage(call?.usage);
-      if (id && turnId && usage.exact) ledger.usageCalls[id] = { id, turnId, usage, usageKey: normalizeText(call.usageKey, 500) || usageKey(usage), observedAt: toCount(call.observedAt), source: normalizeText(call.source, 80) };
-    }
     for (const invocation of Array.isArray(raw.invocations) ? raw.invocations : []) {
       const normalized = normalizeProfileInvocation(invocation);
       const id = normalizeText(invocation?.invocationId || invocation?.id, 300);
@@ -591,6 +585,16 @@ const VERSION = "0.7.8.1";
     });
   }
 
+  function profileLedgerClearUsageCalls(db) {
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(PROFILE_LEDGER_STORE_USAGE_CALLS, "readwrite");
+      tx.objectStore(PROFILE_LEDGER_STORE_USAGE_CALLS).clear();
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error || new Error("profile ledger usage-call cleanup failed"));
+      tx.onabort = () => reject(tx.error || new Error("profile ledger usage-call cleanup aborted"));
+    });
+  }
+
   function mergeProfileTurn(existing, next) {
     if (!existing) return next;
     const merged = { ...existing, ...next };
@@ -644,13 +648,9 @@ const VERSION = "0.7.8.1";
     })
       .then(async (db) => {
         state.profileLedgerDb = db;
-        const tx = db.transaction(
-          [PROFILE_LEDGER_STORE_TURNS, PROFILE_LEDGER_STORE_USAGE_CALLS, PROFILE_LEDGER_STORE_INVOCATIONS],
-          "readonly",
-        );
+        const tx = db.transaction([PROFILE_LEDGER_STORE_TURNS, PROFILE_LEDGER_STORE_INVOCATIONS], "readonly");
         const stored = await Promise.all([
           profileLedgerRequest(tx.objectStore(PROFILE_LEDGER_STORE_TURNS).getAll()),
-          profileLedgerRequest(tx.objectStore(PROFILE_LEDGER_STORE_USAGE_CALLS).getAll()),
           profileLedgerRequest(tx.objectStore(PROFILE_LEDGER_STORE_INVOCATIONS).getAll()),
         ]);
         const current = state.profileLedger || profileEmptyLedger();
@@ -662,14 +662,13 @@ const VERSION = "0.7.8.1";
           if (!previous || String(turn.capturedAt) >= String(previous.capturedAt)) turns.set(turn.turnId, turn);
         }
         current.turns = Array.from(turns.values());
-        for (const call of stored[1]) {
-          if (call?.id && !current.usageCalls[call.id]) current.usageCalls[call.id] = call;
-        }
-        for (const invocation of stored[2]) {
+        current.usageCalls = {};
+        for (const invocation of stored[1]) {
           if (invocation?.invocationId && !current.invocations[invocation.invocationId]) current.invocations[invocation.invocationId] = invocation;
         }
         state.profileLedger = current;
         profileLedgerRebuildRollup();
+        await profileLedgerClearUsageCalls(db);
         await profileLedgerWriteSnapshot(db);
         saveProfileLedgerSnapshot();
         scheduleProfileUsageRefresh(0);
@@ -3471,6 +3470,43 @@ const VERSION = "0.7.8.1";
     return out;
   }
 
+  function tokenCountTotalUsage(value, depth = 0, seen = new WeakSet()) {
+    if (!value || depth > 8) return null;
+    if (typeof value === "string") {
+      try {
+        return tokenCountTotalUsage(JSON.parse(value), depth + 1, seen);
+      } catch {
+        for (const fragment of extractJsonFragmentsFromSse(value)) {
+          try {
+            const usage = tokenCountTotalUsage(JSON.parse(fragment), depth + 1, seen);
+            if (usage?.exact) return usage;
+          } catch {
+            // Ignore malformed stream fragments.
+          }
+        }
+        return null;
+      }
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const usage = tokenCountTotalUsage(item, depth + 1, seen);
+        if (usage?.exact) return usage;
+      }
+      return null;
+    }
+    if (typeof value !== "object" || seen.has(value)) return null;
+    seen.add(value);
+    for (const key of ["totalTokenUsage", "total_token_usage"]) {
+      const usage = normalizeUsage(value[key]);
+      if (usage.exact) return usage;
+    }
+    for (const key of ["response", "payload", "info", "data", "body", "message", "result", "event", "params"]) {
+      const usage = tokenCountTotalUsage(value[key], depth + 1, seen);
+      if (usage?.exact) return usage;
+    }
+    return null;
+  }
+
   function sourceMayContainAssistantResult(source) {
     return !/body/i.test(String(source || ""));
   }
@@ -4148,6 +4184,7 @@ const VERSION = "0.7.8.1";
       sessionKey: key,
       startedAt: toCount(Date.parse(last.startedAt || last.createdAt)) || Date.now(),
       calls: [{ usage, source: "restored-live", observedAt: toCount(last.observedAt) || Date.now() }],
+      callCount: toCount(last.callCount) || 1,
       context: {
         effort: normalizeReasoningEffort(last.effort),
         fastMode: typeof last.fastMode === "boolean" ? last.fastMode : null,
@@ -4271,7 +4308,7 @@ const VERSION = "0.7.8.1";
       sessionKey: turn.sessionKey,
       threadKey: turn.threadKey || turn.sessionKey,
       source: "codex-live-token-cost",
-      callCount: turn.calls.length,
+      callCount: toCount(turn.callCount) || turn.calls.length,
       model: modelName(),
       effort: normalizeReasoningEffort(turn.context?.effort || activeModelInfo().effort),
       fastMode: typeof turn.context?.fastMode === "boolean" ? turn.context.fastMode : null,
@@ -4331,7 +4368,7 @@ const VERSION = "0.7.8.1";
     if (isTransientSessionKey(key)) return false;
     state.localLast = { ...metric, persistReason: reason };
     state.localLedger = state.localLedger.filter((item) => item.turnId !== metric.turnId).concat(state.localLast);
-    state.localPersistedUsage.set(usageKey(metric.usage), Date.now());
+    if (reason !== "live") state.localPersistedUsage.set(usageKey(metric.usage), Date.now());
     if (reason === "live") scheduleLocalLedgerSave();
     else flushLocalLedgerSave(true);
     if (reason !== "live") rememberDailyUsage(metric);
@@ -4367,13 +4404,20 @@ const VERSION = "0.7.8.1";
       }
     }
     turn.context = mergeProfileContext(turn.context, context);
-    const existing = turn.calls.find((call) => usageKey(call.usage) === key);
-    if (existing) {
-      existing.source = source;
-      existing.observedAt = now;
-      existing.usage = usage;
+    const replaceCurrentTurnUsage = options.replaceCurrentTurnUsage === true;
+    let existing = null;
+    if (replaceCurrentTurnUsage) {
+      turn.calls = [{ usage, source, observedAt: now, cumulative: true }];
+      turn.callCount = toCount(turn.callCount) + 1;
     } else {
-      turn.calls.push({ usage, source, observedAt: now });
+      existing = turn.calls.find((call) => usageKey(call.usage) === key);
+      if (existing) {
+        existing.source = source;
+        existing.observedAt = now;
+        existing.usage = usage;
+      } else {
+        turn.calls.push({ usage, source, observedAt: now });
+      }
     }
     if (!(Number(turn.outputStartedAt) > 0) && toCount(aggregateTurnUsage(turn).output)) turn.outputStartedAt = now;
     const metric = localTurnMetric(turn, now);
@@ -4382,7 +4426,7 @@ const VERSION = "0.7.8.1";
       observedAt: now,
       reason: persist ? "final-observed" : "usage-observed",
       durationStatus: "incomplete",
-      calls: existing ? [] : [{ usage, source }],
+      calls: replaceCurrentTurnUsage || existing ? [] : [{ usage, source }],
       invocations: Array.isArray(options.invocations) ? options.invocations : context.invocations,
       invocationEventId: options.invocationEventId,
       threadKey: options.profileThreadKey,
@@ -4452,11 +4496,14 @@ const VERSION = "0.7.8.1";
     });
     let changed = false;
     const persistUsage = shouldPersistUsagePayload(payload, source);
+    const cumulativeTokenUsage = tokenCountPayload ? tokenCountTotalUsage(payload) : null;
     if (canUseCurrentSessionForUsage) {
-      for (const usage of collectUsages(payload)) {
+      const usages = cumulativeTokenUsage?.exact ? [cumulativeTokenUsage] : collectUsages(payload);
+      for (const usage of usages) {
         changed =
           rememberLocalUsage(usage, source, context, {
             persist: persistUsage,
+            replaceCurrentTurnUsage: Boolean(cumulativeTokenUsage?.exact),
             sessionKey,
             invocations,
             invocationEventId,
@@ -4508,7 +4555,7 @@ const VERSION = "0.7.8.1";
             threadKey: current.threadKey || current.sessionKey,
             startedAt: current.startedAt,
             outputStartedAt: current.outputStartedAt,
-            callCount: current.calls.length,
+            callCount: toCount(current.callCount) || current.calls.length,
             durationMs: currentDurationMs,
             usage: aggregateTurnUsage(current),
             model: modelName(),
@@ -9795,6 +9842,7 @@ const VERSION = "0.7.8.1";
       currentLocalTurnSessionKeys: () => Array.from(state.localCurrentTurns.keys()),
       isOfficialThreadRunning,
       collectUsages,
+      tokenCountTotalUsage,
       hasAssistantResultOutputStarted,
       fmtCount,
       fmtMoney,
@@ -9886,6 +9934,19 @@ const VERSION = "0.7.8.1";
       ccSwitchSettingsHtml,
       helperStatusText,
       profileUsageRefreshRequests: () => state.profileUsageRefreshRequests,
+      performanceState(sessionKey = currentSessionKey()) {
+        ensureProfileLedgerLoaded();
+        const turn = localCurrentTurn(sessionKey);
+        return {
+          currentCalls: Array.isArray(turn?.calls) ? turn.calls.length : 0,
+          currentCallCount: toCount(turn?.callCount) || (Array.isArray(turn?.calls) ? turn.calls.length : 0),
+          currentUsageTotal: toCount(aggregateTurnUsage(turn).total),
+          localPersistedUsage: state.localPersistedUsage.size,
+          profileUsageCalls: Object.keys(state.profileLedger?.usageCalls || {}).length,
+          profilePendingCalls: state.profileLedgerPendingCalls.size,
+          profilePendingTurns: state.profileLedgerPendingTurns.size,
+        };
+      },
       profileUnlockEnabled,
       saveProfileUnlockEnabled,
       setProfileUnlockEnabled,
