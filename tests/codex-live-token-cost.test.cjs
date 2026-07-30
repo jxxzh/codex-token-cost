@@ -97,9 +97,9 @@ assert.equal(code.includes('pushState(history.state, "", "/settings/profile")'),
 assert.equal(code.includes("@run-at       document-start"), true);
 assert.equal(code.includes("window.postMessage(message"), true);
 assert.equal(code.includes('"codex-message-from-view"'), true);
-assert.equal(code.includes('const VERSION = "0.7.8.2"'), true);
+assert.equal(code.includes('const VERSION = "0.7.9.1"'), true);
 assert.equal(code.includes("function syncSidebarProfileIdentity"), true);
-assert.equal(code.includes("void installProfileAuthContextPatch();"), false);
+assert.equal(code.includes("void installProfileAuthContextPatch();"), true);
 assert.equal(code.includes("profileAuthValuePatches"), false);
 assert.equal(code.includes("Flatpickr 4.6.13 + zh locale"), true);
 assert.equal(code.includes("--cltc-calendar-accent: rgb(76, 78, 80)"), true);
@@ -768,6 +768,11 @@ context.__CODEX_LIVE_TOKEN_COST_PRICES__["gpt-test-data-source"] = { input: 9, c
 vm.runInNewContext(code, context, { filename: scriptPath });
 
 const api = context.__codexLiveTokenCostTest;
+assert.equal(
+  storage.get("__codexLiveTokenCostProfileUnlockEnabledV1"),
+  "false",
+  "升级后应一次性关闭历史遗留的 Profile 解锁，避免仅启用 Token 面板时启动全页观察器",
+);
 assert.equal(context.Promise.prototype.then.__codexLiveTokenCostProfileUnlock, undefined);
 assert.equal(context.Array.prototype.filter.__codexLiveTokenCostProfileUnlock, undefined);
 assert.equal(context.RegExp.prototype.test.__codexLiveTokenCostProfileUnlock, undefined);
@@ -775,6 +780,7 @@ storage.delete("__codexLiveTokenCostProfileUnlockEnabledV1");
 assert.equal(api.profileUnlockEnabled(), false);
 storage.set("__codexLiveTokenCostProfileUnlockEnabledV1", "true");
 assert.equal(api.profileUnlockEnabled(), true);
+assert.equal(api.setProfileUnlockEnabled(true), true);
 assert.equal(typeof api.spoofProfileAccountPayload, "function");
 assert.equal(typeof api.beginLocalTurn, "function");
 assert.equal(typeof api.persistLocalCurrentTurn, "function");
@@ -808,6 +814,31 @@ assert.equal(typeof api.syncProfileUsageQueryCache, "function");
 assert.equal(typeof api.extractFastMode, "function");
 assert.equal(typeof api.collectProfileInvocations, "function");
 assert.equal(typeof api.isComposerDraftPayload, "function");
+assert.equal(typeof api.profileLedgerUpsertTurn, "function");
+assert.equal(typeof api.profileLedgerObserveLocalTurn, "function");
+
+const hydratedTurnIndex = api.profileLedgerRebuildTurnIndex(
+  api.profileNormalizeSnapshot({
+    version: 2,
+    migrationComplete: true,
+    turns: [
+      { turnId: "hydrated-index-turn", source: "codex-live-token-cost", usage: { input: 1, output: 2, total: 3 } },
+      { turnId: "hydrated-index-other", source: "codex-live-token-cost", usage: { input: 4, output: 5, total: 9 } },
+    ],
+  }),
+);
+assert.equal(hydratedTurnIndex.get("hydrated-index-turn"), 0);
+assert.equal(hydratedTurnIndex.get("hydrated-index-other"), 1);
+api.profileLedgerUpsertTurn({ turnId: "index-upsert-turn", source: "codex-live-token-cost", model: "gpt-5.5" });
+api.profileLedgerUpsertTurn({ turnId: "index-upsert-turn", source: "codex-live-token-cost", fastMode: true });
+api.profileLedgerUpsertTurn({ turnId: "index-upsert-other", source: "codex-live-token-cost", model: "gpt-5.5" });
+const indexedTurns = api.profileLedgerTurns().filter((turn) => turn.turnId.startsWith("index-upsert-"));
+assert.equal(indexedTurns.length, 2);
+assert.equal(indexedTurns.find((turn) => turn.turnId === "index-upsert-turn").fastMode, true);
+assert.equal(
+  api.profileLedgerTurnIndex({ turns: api.profileLedgerTurns() }).get("index-upsert-turn"),
+  api.profileLedgerTurns().findIndex((turn) => turn.turnId === "index-upsert-turn"),
+);
 assert.equal(typeof api.shouldStartTurnFromRequestPayload, "function");
 assert.equal(typeof api.isTokenCountPayload, "function");
 assert.equal(typeof api.isTaskCompletePayload, "function");
@@ -828,6 +859,38 @@ assert.equal(typeof api.isMainComposerSurfaceTarget, "function");
 assert.equal(typeof api.isCodexPlusText, "function");
 assert.equal(typeof api.findCodexPlusMenu, "function");
 assert.equal(typeof api.ensureHeaderSettingsButton, "function");
+assert.equal(typeof api.trapSettingsFocus, "function");
+const originalActiveElement = context.document.activeElement;
+const modalFocuses = [];
+const firstModalControl = { tagName: "BUTTON", focus: () => modalFocuses.push("first") };
+const middleModalControl = { tagName: "INPUT", focus: () => modalFocuses.push("middle") };
+const lastModalControl = { tagName: "INPUT", focus: () => modalFocuses.push("last") };
+const modalFocusOverlay = {
+  querySelectorAll: (selector) => {
+    assert.match(selector, /a\[href\].*button.*input.*select.*textarea.*\[tabindex\]/);
+    return [firstModalControl, middleModalControl, lastModalControl];
+  },
+};
+let tabPrevented = false;
+context.document.activeElement = middleModalControl;
+assert.equal(api.trapSettingsFocus({ shiftKey: false, preventDefault: () => { tabPrevented = true; } }, modalFocusOverlay), false);
+assert.equal(tabPrevented, false);
+context.document.activeElement = lastModalControl;
+assert.equal(
+  api.trapSettingsFocus({ shiftKey: false, preventDefault: () => { tabPrevented = true; } }, modalFocusOverlay),
+  true,
+);
+assert.equal(tabPrevented, true);
+assert.deepEqual(modalFocuses, ["first"]);
+tabPrevented = false;
+context.document.activeElement = firstModalControl;
+assert.equal(
+  api.trapSettingsFocus({ shiftKey: true, preventDefault: () => { tabPrevented = true; } }, modalFocusOverlay),
+  true,
+);
+assert.equal(tabPrevented, true);
+assert.deepEqual(modalFocuses, ["first", "last"]);
+context.document.activeElement = originalActiveElement;
 assert.equal(typeof api.saveProfilePrefsFromEditor, "function");
 assert.equal(typeof api.locationSessionKey, "function");
 assert.equal(typeof api.activeSidebarThreadKey, "function");
@@ -1181,7 +1244,7 @@ const unavailableCacheWriteHtml = api.usageAnalyticsHtml({
   ],
 });
 assert.equal(unavailableCacheWriteHtml.includes("写缓存<strong>未提供</strong>"), true);
-assert.equal(context.__codexLiveTokenCost.version, "0.7.8.2");
+assert.equal(context.__codexLiveTokenCost.version, "0.7.9.1");
 assert.equal(api.currentSessionKey().startsWith("new:startup:"), true);
 assert.equal(api.extractSessionKeyFromUrl("/thread/thread-1"), "thread-1");
 assert.equal(api.extractSessionKeyFromUrl("/api/conversation?conversationId=thread-1"), "thread-1");
@@ -1870,6 +1933,35 @@ assert.equal(cacheReadUsage.output, 50);
 assert.equal(cacheReadUsage.total, 150);
 assert.equal(api.normalizeUsage({ inputTokens: 10, outputTokens: 2, cachedReadTokens: 50, totalTokens: 12 }).input, 60);
 assert.equal(api.normalizeUsage({ inputTokens: 10, outputTokens: 2, cachedReadTokens: 50, totalTokens: 12 }).cached, 50);
+const totalOnlyUsage = api.normalizeUsage({ total_tokens: 10, output_tokens: 0 });
+assert.equal(totalOnlyUsage.input, 10);
+assert.equal(totalOnlyUsage.output, 0);
+assert.equal(totalOnlyUsage.total, 10);
+const hydratedLegacyProfile = api.profileNormalizeSnapshot({
+  version: 2,
+  usageCalls: [{ id: "legacy-total-only-call", turnId: "hydrated-turn", usage: { total_tokens: 10, output_tokens: 0 } }],
+  turns: [{ turnId: "hydrated-turn", createdAt: "2026-07-20T00:00:00.000Z", usage: { total_tokens: 10, output_tokens: 0 }, invocationIds: ["linked-invocation"] }],
+  invocations: [
+    { invocationId: "linked-invocation", turnId: "hydrated-turn", type: "skill", skill_id: "hydrated-skill", skill_name: "Hydrated" },
+    { invocationId: "orphan-invocation", turnId: "missing-turn", type: "plugin", plugin_id: "orphan-plugin", plugin_name: "Orphan" },
+  ],
+});
+const hydratedLegacyCalls = Object.values(hydratedLegacyProfile.usageCalls);
+assert.equal(hydratedLegacyCalls.length, 0);
+assert.equal(hydratedLegacyProfile.turns[0].usage.input, 10);
+assert.deepEqual(hydratedLegacyProfile.turns[0].invocationIds, ["linked-invocation"]);
+assert.equal(hydratedLegacyProfile.invocations["orphan-invocation"].turnId, "missing-turn");
+const mixedLocalBucket = { input: 70, output: 30, cached: 700, total: 100, cost: 0.01, requests: 7, turns: 1 };
+const mixedCcBucket = { input: 10, output: 40, cached: 1, total: 90, cost: 0.02, requests: 2, turns: 1 };
+assert.equal(
+  JSON.stringify(api.profileDisplayedBucket({ date: "2026-07-20", local: mixedLocalBucket, ccSwitch: mixedCcBucket })),
+  JSON.stringify({ date: "2026-07-20", tokens: 100, input: 70, output: 30, cached: 700, requests: 7, cost: 0.01 }),
+);
+const ccDominantBucket = { input: 90, output: 60, cached: 50, total: 150, cost: 0.03, requests: 9, turns: 2 };
+assert.equal(
+  JSON.stringify(api.profileDisplayedBucket({ date: "2026-07-20", local: mixedLocalBucket, ccSwitch: ccDominantBucket })),
+  JSON.stringify({ date: "2026-07-20", tokens: 150, input: 90, output: 60, cached: 50, requests: 9, cost: 0.03 }),
+);
 const cacheWriteUsage = api.normalizeUsage({
   input_tokens: 1000,
   output_tokens: 100,
@@ -2120,9 +2212,11 @@ const delayedAuthContext = {
   _currentValue2: delayedRawApiAuth,
 };
 let delayedProfileButton = null;
+let delayedProfileQuerySelectorCalls = 0;
 const delayedProfileDocument = {
   body: {},
   querySelector() {
+    delayedProfileQuerySelectorCalls += 1;
     return delayedProfileButton;
   },
 };
@@ -2141,6 +2235,14 @@ context.MutationObserver = class ProfileReadinessObserver {
 assert.equal(api.installProfileUiReadinessCoordinator(["ProfileFooterHarness"], delayedProfileDocument), false);
 assert.equal(context.__codexLiveTokenCostProfileAuthPatch, "waiting");
 assert.ok(profileReadinessObserver);
+const delayedProfileProbeCallsBeforeMutationBurst = delayedProfileQuerySelectorCalls;
+const delayedProfileTimersBeforeMutationBurst = delayedTimers.length;
+for (let index = 0; index < 1000; index += 1) profileReadinessObserver.callback([{ addedNodes: [] }]);
+assert.equal(
+  delayedProfileQuerySelectorCalls - delayedProfileProbeCallsBeforeMutationBurst <= 1,
+  true,
+  "Profile 就绪观察器必须合并高频 DOM 变更，不能为每次变更同步扫描 React Fiber",
+);
 delayedProfileButton = {
   __reactFiber$delayedProfile: {
     dependencies: {
@@ -2152,8 +2254,12 @@ delayedProfileButton = {
     return { width: 184, height: 29 };
   },
 };
-profileReadinessObserver.callback([{ addedNodes: [delayedProfileButton] }]);
-assert.equal(context.__codexLiveTokenCostProfileAuthPatch, "0.7.8.2");
+const delayedProfileReadinessTimer = delayedTimers
+  .slice(delayedProfileTimersBeforeMutationBurst)
+  .find((timer) => timer.delay === 250);
+assert.ok(delayedProfileReadinessTimer);
+delayedProfileReadinessTimer.handler();
+assert.equal(context.__codexLiveTokenCostProfileAuthPatch, "0.7.9.1");
 assert.equal(api.profileSyntheticAuth(), true);
 assert.equal(profileReadinessObserver.disconnected, true);
 assert.equal(delayedProfileCacheWrites.length > 0, true);
@@ -2462,6 +2568,39 @@ assert.equal(
   ]).fastModePercent,
   null,
 );
+const canonicalActivity = api.localProfileActivityStats([
+  {
+    source: "codex-live-token-cost",
+    fastMode: true,
+    effort: "high",
+    usage: { input: 70, output: 30, total: 100 },
+    invocations: [
+      { type: "skill", skill_id: "review", skill_name: "review" },
+      { type: "plugin", plugin_id: "github", plugin_name: "GitHub" },
+    ],
+  },
+  {
+    source: "codex-live-token-cost",
+    fastMode: false,
+    effort: "high",
+    usage: { input: 20, output: 80, total: 100 },
+    invocations: [{ type: "plugin", plugin_id: "github", plugin_name: "GitHub" }],
+  },
+]);
+assert.equal(canonicalActivity.fastModePercent, 50);
+assert.equal(canonicalActivity.reasoningEffort, "high");
+assert.equal(canonicalActivity.reasoningEffortPercent, 100);
+assert.equal(canonicalActivity.uniqueSkillsUsed, 1);
+assert.equal(canonicalActivity.totalSkillsUsed, 1);
+assert.equal(canonicalActivity.uniquePluginsUsed, 1);
+assert.equal(canonicalActivity.totalPluginsUsed, 2);
+assert.equal(
+  JSON.stringify(canonicalActivity.topInvocations),
+  JSON.stringify([
+    { type: "plugin", plugin_id: "github", plugin_name: "GitHub", usage_count: 2 },
+    { type: "skill", skill_id: "review", skill_name: "review", usage_count: 1 },
+  ]),
+);
 api.mergeHelperStats({
   stats: {
     unique_skills_used: 4,
@@ -2555,7 +2694,16 @@ assert.equal(importedDay.cost, 1.23);
 assert.equal(importedProfile.stats.longest_running_turn_sec, 0);
 const ccSwitchDedupeDay = importedProfile.stats.daily_usage_buckets.find((day) => day.start_date === "2026-06-15");
 assert.equal(ccSwitchDedupeDay.tokens, 5500);
-assert.equal(ccSwitchDedupeDay.requests, 4);
+assert.equal(ccSwitchDedupeDay.input_tokens, 4000);
+assert.equal(ccSwitchDedupeDay.output_tokens, 1500);
+assert.equal(ccSwitchDedupeDay.cached_tokens, 1200);
+assert.equal(ccSwitchDedupeDay.requests, 2);
+const hubCcSwitchDedupeDay = api.localDailyUsage().get("2026-06-15");
+assert.equal(hubCcSwitchDedupeDay.tokens, 5500);
+assert.equal(hubCcSwitchDedupeDay.input, 4000);
+assert.equal(hubCcSwitchDedupeDay.output, 1500);
+assert.equal(hubCcSwitchDedupeDay.cached, 1200);
+assert.equal(hubCcSwitchDedupeDay.requests, 2);
 const ccSwitchResidual = api.localUsageExport().turns.find((turn) => turn.turnId === "cc-switch:2026-06-15:gpt-5.5");
 assert.equal(JSON.stringify(ccSwitchResidual.usage), JSON.stringify({ input: 1700, output: 600, cached: 250, total: 2300, exact: true }));
 assert.equal(ccSwitchResidual.callCount, 4);
@@ -3281,7 +3429,17 @@ const officialProfileButton = {
   },
 };
 const officialMenuLabel = fakeSpan("custom", "flex-1 min-w-0 truncate");
-const officialMenuRowChildren = [officialMenuLabel];
+const staleMenuAvatar = fakeNode("span", "", "inline-flex items-center justify-center leading-none icon-sm shrink-0");
+staleMenuAvatar.setAttribute("data-cltc-profile-menu-identity-avatar", "");
+const officialMenuAvatar = fakeNode("span", "", "inline-flex items-center justify-center leading-none icon-sm shrink-0");
+const officialMenuAvatarImage = fakeNode("img", "", "icon-sm rounded-full");
+officialMenuAvatarImage.src = "official-avatar";
+officialMenuAvatar.children.push(officialMenuAvatarImage);
+const officialMenuRowChildren = [staleMenuAvatar, officialMenuAvatar, officialMenuLabel];
+staleMenuAvatar.remove = () => {
+  const index = officialMenuRowChildren.indexOf(staleMenuAvatar);
+  if (index >= 0) officialMenuRowChildren.splice(index, 1);
+};
 const officialMenuRow = {
   className: "flex w-full items-center gap-1.5",
   querySelector(selector) {
@@ -3415,13 +3573,8 @@ assert.equal(officialAccountMenuItem, officialProfileMenu.querySelector("[role='
 assert.equal(officialMenuLabel.textContent, api.localProfileResponse().profile.display_name);
 assert.equal(officialMenuRowChildren.length, 2);
 assert.equal(officialMenuRowChildren[0].tagName, "SPAN");
-assert.equal(
-  officialMenuRowChildren[0].className,
-  "inline-flex items-center justify-center leading-none icon-sm shrink-0 opacity-75 group-focus:opacity-100 group-hover:opacity-100",
-);
-assert.equal(officialMenuRowChildren[0].children[0].tagName, "IMG");
-assert.equal(officialMenuRowChildren[0].children[0].className, "icon-sm rounded-full");
-assert.equal(officialMenuRowChildren[0].children[0].src, api.localProfileResponse().profile.profile_picture_url);
+assert.equal(officialMenuRowChildren[0], officialMenuAvatar);
+assert.equal(officialMenuAvatarImage.src, "official-avatar");
 assert.equal(officialProfileMenu.settingsItem, officialSettingsMenuItem);
 assert.equal(officialProfileMenu.querySelector("[role='menuitem']"), officialAccountMenuItem);
 assert.equal(officialAccountMenuItem.getAttribute("aria-disabled"), null);
@@ -3432,6 +3585,9 @@ assert.equal(officialAccountMenuListeners.get("click")?.length, 1);
 assert.equal(officialAccountMenuListeners.get("keydown")?.length, 1);
 assert.equal(api.syncSidebarProfileMenuIdentity(officialProfileDoc, officialProfileButton), true);
 assert.equal(officialMenuRowChildren.length, 2);
+assert.equal(officialMenuRowChildren[0], officialMenuAvatar);
+assert.equal(officialMenuAvatarImage.src, "official-avatar");
+assert.equal(officialMenuRow.querySelector("[data-cltc-profile-menu-identity-avatar]"), null);
 assert.equal(officialAccountMenuListeners.get("click")?.length, 1);
 assert.equal(officialAccountMenuListeners.get("keydown")?.length, 1);
 let accountClickPrevented = 0;
@@ -3465,7 +3621,8 @@ assert.match(officialAccountMenuItem.className, /cursor-default/);
 assert.equal(officialAccountMenuListeners.get("click")?.length, 0);
 assert.equal(officialAccountMenuListeners.get("keydown")?.length, 0);
 assert.equal(officialMenuLabel.textContent, "custom");
-assert.equal(officialMenuRowChildren.length, 1);
+assert.equal(officialMenuRowChildren.length, 2);
+assert.equal(officialMenuRowChildren[0], officialMenuAvatar);
 assert.equal(
   code.includes("icon-sm flex shrink-0 items-center justify-center rounded-full bg-token-charts-purple/10 text-[10px] leading-none font-medium text-token-charts-purple"),
   true,
@@ -4309,6 +4466,36 @@ api.mergeHelperStats({
 assert.equal(api.profileUsageRefreshRequests(), helperRefreshRequestsBeforeDuplicateMerge);
 const profileLifecycleTest = Promise.resolve()
   .then(async () => {
+    const observedProfileQueryRows = [];
+    const observedProfileCacheListeners = [];
+    const observedProfileCacheWrites = [];
+    const observedProfileCacheClient = {
+      invalidateQueries() {},
+      getQueryCache() {
+        return {
+          getAll() {
+            return observedProfileQueryRows;
+          },
+          subscribe(listener) {
+            observedProfileCacheListeners.push(listener);
+            return () => {
+              const index = observedProfileCacheListeners.indexOf(listener);
+              if (index >= 0) observedProfileCacheListeners.splice(index, 1);
+            };
+          },
+        };
+      },
+      setQueryData(queryKey, data) {
+        observedProfileCacheWrites.push({ queryKey, data });
+      },
+    };
+    assert.equal(api.syncProfileUsageQueryCache(observedProfileCacheClient), true);
+    assert.equal(observedProfileCacheListeners.length, 1);
+    const writesBeforeProfileQueryAdded = observedProfileCacheWrites.length;
+    observedProfileQueryRows.push({ queryKey: ["profile", "usage", "disabled"] });
+    observedProfileCacheListeners[0]({ type: "added", query: { queryKey: ["profile", "usage", "disabled"] } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(observedProfileCacheWrites.length > writesBeforeProfileQueryAdded, true);
     const originalScripts = context.document.scripts;
     const originalQuerySelectorAll = context.document.querySelectorAll;
     const originalPerformance = context.performance;
@@ -4402,7 +4589,7 @@ const profileLifecycleTest = Promise.resolve()
     const localMessageHandler = api.localMessageHandler();
     assert.equal(typeof localMessageHandler, "function");
     assert.equal((windowListeners.get("message") || []).length, messageListenersBeforeLocalCapture + 1);
-assert.equal(context.__codexLiveTokenCostMessageCapture, "0.7.8.2");
+assert.equal(context.__codexLiveTokenCostMessageCapture, "0.7.9.1");
     context.document.getElementById = () => null;
     context.__codexLiveTokenCost.destroy();
     assert.equal((windowListeners.get("message") || []).includes(localMessageHandler), false);
@@ -4930,6 +5117,23 @@ profileLifecycleTest.then(async () => {
   );
   idbApi.finishLocalTurn(0, { reason: "idb-roundtrip-complete", force: true, sessionKey: "idb-roundtrip-thread" });
   for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
+  const idbDatabase = await new Promise((resolve, reject) => {
+    const request = context.indexedDB.open("codex-live-token-cost-profile");
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  await new Promise((resolve, reject) => {
+    const request = idbDatabase.transaction("profileUsageCalls", "readwrite").objectStore("profileUsageCalls").put({
+      id: "legacy-total-only-call",
+      turnId: "idb-roundtrip-turn",
+      usage: { total_tokens: 42, output_tokens: 0 },
+      observedAt: currentNow,
+      source: "legacy",
+    });
+    request.onsuccess = resolve;
+    request.onerror = () => reject(request.error);
+  });
+  idbDatabase.close();
   const persistedSnapshot = JSON.parse(storage.get("__codexLiveTokenCostProfileLedgerV2"));
   assert.equal(persistedSnapshot.storage, "indexeddb");
   assert.equal(persistedSnapshot.rollup.days["2026-07-20"].tokens, 42);
@@ -4970,6 +5174,82 @@ profileLifecycleTest.then(async () => {
   assert.equal(afterIdbHydration.stats.most_used_reasoning_effort, "high");
   assert.equal(afterIdbHydration.stats.unique_skills_used, 1);
   assert.equal(afterIdbHydration.stats.total_skills_used, 1);
+  idbApi.profileLedgerUpsertTurn({
+    turnId: "idb-roundtrip-turn",
+    source: "codex-live-token-cost",
+    usage: { input: 42, output: 0, total: 42 },
+  });
+  assert.equal(idbApi.profileLedgerTurns().filter((turn) => turn.turnId === "idb-roundtrip-turn").length, 1);
+  const hydratedDatabase = await new Promise((resolve, reject) => {
+    const request = context.indexedDB.open("codex-live-token-cost-profile");
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const hydratedUsageCalls = await new Promise((resolve, reject) => {
+    const request = hydratedDatabase.transaction("profileUsageCalls", "readonly").objectStore("profileUsageCalls").getAll();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  hydratedDatabase.close();
+  assert.equal(hydratedUsageCalls.length, 1);
+  assert.equal(hydratedUsageCalls[0].id, `idb-roundtrip-turn\u0001${hydratedUsageCalls[0].usageKey}`);
+  assert.equal(hydratedUsageCalls[0].usage.input, 42);
+
+  const originalSnapshotSetItem = context.localStorage.setItem;
+  context.localStorage.setItem = function quotaLimitedLedgerSnapshot(key, value) {
+    if (key === "__codexLiveTokenCostProfileLedgerV2" && !String(value).includes('"hydrationRequired":true')) {
+      const error = new Error("quota exceeded");
+      error.name = "QuotaExceededError";
+      throw error;
+    }
+    return originalSnapshotSetItem.call(this, key, value);
+  };
+  assert.equal(idbApi.saveProfileLedgerSnapshot(), false);
+  context.localStorage.setItem = originalSnapshotSetItem;
+  const compactLedgerSnapshot = JSON.parse(storage.get("__codexLiveTokenCostProfileLedgerV2"));
+  assert.equal(compactLedgerSnapshot.storage, "indexeddb");
+  assert.equal(compactLedgerSnapshot.hydrationRequired, true);
+  assert.equal(Object.hasOwn(compactLedgerSnapshot, "rollup"), false);
+  context.localStorage.setItem = function blockedLedgerSnapshot(key, value) {
+    if (key === "__codexLiveTokenCostProfileLedgerV2") throw new Error("quota exceeded");
+    return originalSnapshotSetItem.call(this, key, value);
+  };
+  assert.equal(idbApi.saveProfileLedgerSnapshot(), false);
+  context.localStorage.setItem = originalSnapshotSetItem;
+  assert.equal(storage.has("__codexLiveTokenCostProfileLedgerV2"), false);
+  context.__codexLiveTokenCost.destroy();
+  context.indexedDB = createIndexedDbTestDouble();
+  vm.runInNewContext(code, context, { filename: scriptPath });
+  assert.equal(context.__codexLiveTokenCostTest.localProfileResponse().stats.lifetime_tokens, 0);
+  context.__codexLiveTokenCost.destroy();
+  delete context.indexedDB;
+  storage.set(
+    "__codexLiveTokenCostProfileLedgerV2",
+    JSON.stringify({
+      version: 2,
+      storage: "localStorage-fallback",
+      migrationComplete: true,
+      turns: [{ turnId: "hydrated-turn", createdAt: "2026-07-20T00:00:00.000Z", usage: { total_tokens: 10, output_tokens: 0 }, invocationIds: ["linked-invocation"] }],
+      usageCalls: [{ id: "legacy-total-only-call", turnId: "hydrated-turn", usage: { total_tokens: 10, output_tokens: 0 } }],
+      invocations: [
+        { invocationId: "linked-invocation", turnId: "hydrated-turn", type: "skill", skill_id: "hydrated-skill", skill_name: "Hydrated" },
+        { invocationId: "orphan-invocation", turnId: "missing-turn", type: "plugin", plugin_id: "orphan-plugin", plugin_name: "Orphan" },
+      ],
+    }),
+  );
+  vm.runInNewContext(code, context, { filename: scriptPath });
+  const legacyHydrationProfile = context.__codexLiveTokenCostTest.localProfileResponse();
+  const legacyHydrationDay = legacyHydrationProfile.stats.daily_usage_buckets.find((day) => day.start_date === "2026-07-20");
+  assert.equal(legacyHydrationDay.input_tokens, 10);
+  assert.equal(legacyHydrationProfile.stats.total_skills_used, 1);
+  assert.equal(legacyHydrationProfile.stats.total_plugins_used, 0);
+  const legacyApi = context.__codexLiveTokenCostTest;
+  legacyApi.profileLedgerUpsertTurn({
+    turnId: "hydrated-turn",
+    source: "codex-live-token-cost",
+    usage: { input: 10, output: 0, total: 10 },
+  });
+  assert.equal(legacyApi.profileLedgerTurns().filter((turn) => turn.turnId === "hydrated-turn").length, 1);
 }).catch((error) => {
   setImmediate(() => {
     throw error;
